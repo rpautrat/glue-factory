@@ -21,7 +21,7 @@ from tqdm import tqdm
 from ..geometry.homography import (
     compute_homography,
     sample_homography_corners,
-    warp_points,
+    warp_points_torch,
 )
 from ..models.cache_loader import CacheLoader, pad_local_features
 from ..settings import DATA_PATH
@@ -176,7 +176,7 @@ class _Dataset(torch.utils.data.Dataset):
         """Transform keypoints by a homography, threshold them,
         and potentially keep only the best ones."""
         # Warp points
-        features["keypoints"] = warp_points(
+        features["keypoints"] = warp_points_torch(
             features["keypoints"], data["H_"], inverse=False
         )
         h, w = data["image"].shape[1:3]
@@ -186,7 +186,7 @@ class _Dataset(torch.utils.data.Dataset):
             & (features["keypoints"][:, 1] >= 0)
             & (features["keypoints"][:, 1] <= h - 1)
         )
-        features["keypoints"] = features["keypoints"][valid]
+        features = {k: v[valid] for k, v in features.items()}
 
         # Threshold
         if self.conf.load_features.thresh > 0:
@@ -196,7 +196,7 @@ class _Dataset(torch.utils.data.Dataset):
         # Get the top keypoints and pad
         n = self.conf.load_features.max_num_keypoints
         if n > -1:
-            inds = np.argsort(-features["keypoint_scores"])
+            inds = torch.argsort(-features["keypoint_scores"])
             features = {k: v[inds[:n]] for k, v in features.items()}
 
             if self.conf.load_features.force_num_keypoints:
@@ -213,8 +213,11 @@ class _Dataset(torch.utils.data.Dataset):
         else:
             return self.getitem(idx)
 
-    def _read_view(self, img, H_conf, ps, left=False):
+    def _read_view(self, img, name, H_conf, ps, left=False):
         data = sample_homography(img, H_conf, ps)
+        data["scene"], data["name"] = name.split("/")
+        data["name"] = data["name"][:-4]
+        data["scales"] = 1
         if left:
             data["image"] = self.left_augment(data["image"], return_tensor=True)
         else:
@@ -225,6 +228,7 @@ class _Dataset(torch.utils.data.Dataset):
             data["image"] = (data["image"] * gs).sum(0, keepdim=True)
 
         if self.conf.load_features.do:
+            data["H_"] = torch.from_numpy(data["H_"])
             features = self.feature_loader({k: [v] for k, v in data.items()})
             features = self._transform_keypoints(features, data)
             data["cache"] = features
@@ -245,8 +249,8 @@ class _Dataset(torch.utils.data.Dataset):
         if self.conf.right_only:
             left_conf["difficulty"] = 0.0
 
-        data0 = self._read_view(img, left_conf, ps, left=True)
-        data1 = self._read_view(img, self.conf.homography, ps, left=False)
+        data0 = self._read_view(img, name, left_conf, ps, left=True)
+        data1 = self._read_view(img, name, self.conf.homography, ps, left=False)
 
         H = compute_homography(data0["coords"], data1["coords"], [1, 1])
 
